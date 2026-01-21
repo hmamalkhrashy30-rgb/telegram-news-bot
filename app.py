@@ -12,28 +12,15 @@ import time
 # ========== إعدادات من متغيرات البيئة ==========
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHANNEL_USERNAME = os.getenv('CHANNEL_USERNAME', '@MarketNewsArabia')
-CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '300'))  # 5 دقائق
+CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '300'))
 
-# تأكد من وجود التوكن
 if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("❌ TELEGRAM_BOT_TOKEN غير محدد. أضفه في متغيرات البيئة على Render.")
+    raise ValueError("❌ TELEGRAM_BOT_TOKEN غير محدد.")
 
-# ========== Flask App للتحقق من أن الخدمة تعمل ==========
+# ========== Flask App ==========
 app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return jsonify({
-        "status": "running",
-        "service": "Telegram News Bot",
-        "channel": CHANNEL_USERNAME
-    })
-
-@app.route('/health')
-def health():
-    return jsonify({"status": "healthy"}), 200
-
-# ========== نفس كود جلب الأخبار (من النسخة السابقة) ==========
+# ========== نفس كود جلب الأخبار ==========
 NEWS_URLS = {
     "اقتصادية": "https://www.investing.com/news/economic-indicators",
     "فيدرالي": "https://www.investing.com/news/fed-news",
@@ -56,14 +43,39 @@ KEYWORDS = {
 }
 
 sent_articles = set()
+bot_started = False
 
+@app.route('/')
+def home():
+    return jsonify({
+        "status": "running",
+        "service": "Telegram News Bot",
+        "channel": CHANNEL_USERNAME,
+        "bot_started": bot_started,
+        "articles_sent": len(sent_articles)
+    })
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy"}), 200
+
+@app.route('/check-now')
+def check_now_manual():
+    """فحص يدوي للأخبار"""
+    if not bot_started:
+        return jsonify({"error": "البوت لم يبدأ بعد"}), 400
+    threading.Thread(target=run_once_check).start()
+    return jsonify({"message": "جاري الفحص اليدوي الآن..."})
+
+# ========== وظائف جلب الأخبار ==========
 async def fetch_news(session, url, category):
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept-Language': 'ar,en;q=0.9'
     }
     
     try:
-        async with session.get(url, headers=headers, timeout=10) as response:
+        async with session.get(url, headers=headers, timeout=15) as response:
             if response.status == 200:
                 html = await response.text()
                 return parse_news(html, category)
@@ -75,15 +87,24 @@ def parse_news(html, category):
     soup = BeautifulSoup(html, 'html.parser')
     articles = []
     
-    # تحديث: البحث عن العناصر الصحيحة في Investing.com
-    news_items = soup.find_all('article', class_='js-article-item')
+    # محاولات مختلفة للعثور على الأخبار
+    selectors = [
+        'article.js-article-item',
+        'div.mediumTitle1 article',
+        'div.largeTitle article',
+        'div[class*="articleItem"]',
+        'div.textDiv'
+    ]
     
-    if not news_items:
-        news_items = soup.find_all('div', class_=['mediumTitle1', 'articleItem'])
+    for selector in selectors:
+        news_items = soup.select(selector)
+        if news_items:
+            break
     
-    for item in news_items[:10]:
+    for item in news_items[:8]:  # أول 8 أخبار فقط
         try:
-            title_elem = item.find('a', class_='title')
+            # العثور على العنوان
+            title_elem = item.find('a', class_='title') or item.find('a', href=True)
             if not title_elem:
                 continue
                 
@@ -93,16 +114,22 @@ def parse_news(html, category):
             if link and not link.startswith('http'):
                 link = f"https://www.investing.com{link}"
             
-            time_elem = item.find('time')
+            # العثور على الوقت
+            time_elem = item.find('time') or item.find('span', class_='date')
             time_text = time_elem.text.strip() if time_elem else "قبل قليل"
             
             # تصنيف الخبر
             news_type = "عام"
+            title_lower = title.lower()
             for type_name, keywords in KEYWORDS.items():
                 for keyword in keywords:
-                    if keyword.lower() in title.lower():
+                    if keyword.lower() in title_lower:
                         news_type = type_name
                         break
+            
+            # معرّف فريد للخبر
+            import hashlib
+            unique_id = hashlib.md5(f"{title}{time_text}".encode()).hexdigest()[:10]
             
             article_data = {
                 'title': title,
@@ -110,7 +137,7 @@ def parse_news(html, category):
                 'time': time_text,
                 'category': category,
                 'type': news_type,
-                'unique_id': hash(f"{title[:30]}{time_text}")
+                'unique_id': unique_id
             }
             
             articles.append(article_data)
@@ -122,7 +149,7 @@ def parse_news(html, category):
 def filter_important_news(articles):
     important = []
     for article in articles:
-        if article['type'] != "عام":
+        if article['type'] != "عام" and article['link']:
             important.append(article)
     return important
 
@@ -141,15 +168,15 @@ async def send_telegram_message(bot, article):
         
         emoji = emoji_map.get(article['type'], '📰')
         
+        # تنسيق الرسالة بشكل أفضل
         message = f"""
-{emoji} **{article['type'].upper()}** {emoji}
+{emoji} **{article['type'].upper()}** | {article['category']} {emoji}
 
-📌 {article['title']}
+{article['title']}
 
 ⏰ {article['time']}
-🏷️ {article['category']}
 
-🔗 [قراءة الخبر كاملاً]({article['link']})
+🔗 [قراءة الخبر]({article['link']})
         """
         
         await bot.send_message(
@@ -159,79 +186,132 @@ async def send_telegram_message(bot, article):
             disable_web_page_preview=False
         )
         
-        logging.info(f"✅ تم إرسال: {article['title'][:50]}...")
+        logging.info(f"✅ تم إرسال خبر: {article['title'][:40]}...")
         sent_articles.add(article['unique_id'])
+        return True
         
     except Exception as e:
         logging.error(f"❌ خطأ في إرسال الرسالة: {e}")
+        return False
 
-# ========== الدورة الرئيسية في thread منفصل ==========
+# ========== الدورة الرئيسية ==========
 async def news_check_loop():
+    """الدورة الرئيسية للفحص التلقائي"""
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                logging.info("🔄 بدء فحص الأخبار...")
+                logging.info("🔄 بدء فحص الأخبار التلقائي...")
                 
                 all_articles = []
-                tasks = []
                 
+                # جلب الأخبار من جميع المصادر
                 for category, url in NEWS_URLS.items():
-                    tasks.append(fetch_news(session, url, category))
+                    try:
+                        articles = await fetch_news(session, url, category)
+                        all_articles.extend(articles)
+                        logging.info(f"   📰 {category}: {len(articles)} خبر")
+                        await asyncio.sleep(1)  # انتظار بين الطلبات
+                    except Exception as e:
+                        logging.error(f"   ❌ خطأ في {category}: {e}")
                 
-                results = await asyncio.gather(*tasks)
-                
-                for result in results:
-                    all_articles.extend(result)
-                
+                # تصفية الأخبار المهمة
                 important_news = filter_important_news(all_articles)
                 
                 # إرسال الأخبار الجديدة فقط
                 new_count = 0
                 for article in important_news:
                     if article['unique_id'] not in sent_articles:
-                        await send_telegram_message(bot, article)
-                        new_count += 1
-                        await asyncio.sleep(1)
+                        success = await send_telegram_message(bot, article)
+                        if success:
+                            new_count += 1
+                            await asyncio.sleep(2)  # انتظار بين الإرسال
                 
-                if len(sent_articles) > 1000:
+                # تنظيف الذاكرة
+                if len(sent_articles) > 500:
+                    # حفظ آخر 500 فقط
+                    sent_list = list(sent_articles)
                     sent_articles.clear()
+                    sent_articles.update(sent_list[-500:])
                 
                 if new_count > 0:
                     logging.info(f"📤 تم إرسال {new_count} خبر جديد")
                 else:
-                    logging.info("⚠️ لا توجد أخبار جديدة")
+                    logging.info("ℹ️ لا توجد أخبار جديدة مهمة")
+                
+                logging.info(f"⏳ الانتظار {CHECK_INTERVAL} ثانية للفحص التالي...")
                 
             except Exception as e:
                 logging.error(f"🚨 خطأ في الدورة الرئيسية: {e}")
             
             await asyncio.sleep(CHECK_INTERVAL)
 
-def start_bot_thread():
-    """تشغيل البوت في thread منفصل"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(news_check_loop())
+def run_once_check():
+    """فحص يدوي لمرة واحدة"""
+    async def one_time():
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        async with aiohttp.ClientSession() as session:
+            logging.info("🔍 بدء فحص يدوي...")
+            all_articles = []
+            for category, url in NEWS_URLS.items():
+                articles = await fetch_news(session, url, category)
+                all_articles.extend(articles)
+            
+            important = filter_important_news(all_articles)
+            for article in important[:3]:  # أول 3 فقط في الفحص اليدوي
+                if article['unique_id'] not in sent_articles:
+                    await send_telegram_message(bot, article)
+                    await asyncio.sleep(1)
+    
+    asyncio.run(one_time())
 
-# ========== بدء التشغيل عند تشغيل الخدمة ==========
-@app.before_first_request
-def start_background_thread():
-    """بدء thread البوت عند تشغيل الخدمة"""
-    thread = threading.Thread(target=start_bot_thread, daemon=True)
-    thread.start()
-    logging.info("🤖 تم بدء بوت الأخبار في الخلفية")
+def start_bot():
+    """بدء تشغيل البوت"""
+    global bot_started
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # اختبار البوت أولاً
+        test_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        test_info = loop.run_until_complete(test_bot.get_me())
+        logging.info(f"🤖 البوت جاهز: @{test_info.username}")
+        
+        # بدء الدورة الرئيسية
+        bot_started = True
+        loop.run_until_complete(news_check_loop())
+    except Exception as e:
+        logging.error(f"🚨 فشل بدء البوت: {e}")
+        bot_started = False
 
-# ========== نقطة الدخول الرئيسية ==========
+# ========== بدء التشغيل ==========
 if __name__ == "__main__":
     # إعداد التسجيل
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('bot.log', encoding='utf-8')
+        ]
     )
     
-    logging.info("🚀 بدء تشغيل بوت أخبار الأسواق على Render...")
+    logger = logging.getLogger(__name__)
     
-    # بدء Flask app
-    port = int(os.getenv('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    # بدء البوت في thread منفصل
+    def run_flask():
+        port = int(os.getenv('PORT', 10000))
+        app.run(host='0.0.0.0', port=port, debug=False)
+    
+    # بدء Flask في thread منفصل
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    logging.info("🚀 بدء تشغيل بوت أخبار الأسواق...")
+    logging.info(f"📢 القناة: {CHANNEL_USERNAME}")
+    logging.info(f"⏰ فترة الفحص: {CHECK_INTERVAL} ثانية")
+    
+    # بدء البوت بعد تأخير قصير
+    time.sleep(3)
+    start_bot()
