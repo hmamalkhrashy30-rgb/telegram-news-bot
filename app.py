@@ -2,69 +2,64 @@ import os
 import logging
 import asyncio
 import aiohttp
+import aiohttp.client_exceptions
 from bs4 import BeautifulSoup
-from telegram import Bot
+from telegram import Bot, error
 from flask import Flask, jsonify
 import threading
 import time
-import random
 import hashlib
 from datetime import datetime
-from fake_useragent import UserAgent
+import xml.etree.ElementTree as ET
+import re
 
 # ========== إعدادات ==========
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+# مهم: يجب أن يكون معرف القناة (يبدأ بـ @) وليس رابط
 CHANNEL_USERNAME = os.getenv('CHANNEL_USERNAME', '@DO_IUi')
-CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '1800'))  # 30 دقيقة
+CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '600'))  # 10 دقائق
 
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("❌ TELEGRAM_BOT_TOKEN غير محدد.")
 
+# تنظيف معرف القناة إذا كان رابطاً
+if CHANNEL_USERNAME.startswith('http'):
+    # استخراج المعرف من الرابط
+    match = re.search(r't\.me/(\w+)', CHANNEL_USERNAME)
+    if match:
+        CHANNEL_USERNAME = f"@{match.group(1)}"
+elif not CHANNEL_USERNAME.startswith('@'):
+    CHANNEL_USERNAME = f"@{CHANNEL_USERNAME}"
+
+logging.info(f"📢 القناة المضبوطة: {CHANNEL_USERNAME}")
+
 # ========== Flask App ==========
 app = Flask(__name__)
 
-# ========== مصادر الأخبار البديلة ==========
-NEWS_SOURCES = [
-    # مصادر Investing.com (الصفحات الرئيسية)
-    ("أخبار اقتصادية", "https://www.investing.com/", "economy"),
-    ("أسواق المال", "https://www.investing.com/markets/", "markets"),
-    ("سلع", "https://www.investing.com/commodities/", "commodities"),
-    
-    # مصادر بديلة
-    ("رويترز اقتصاد", "https://www.reuters.com/business/", "reuters"),
-    ("بلومبرج", "https://www.bloomberg.com/markets", "bloomberg"),
-    ("CNN أعمال", "https://edition.cnn.com/business", "cnn"),
-    
-    # مصادر RSS مباشرة (أسهل وأسرع)
-    ("Investing RSS", "https://www.investing.com/rss/news.rss", "rss"),
-    ("Reuters RSS", "https://www.reutersagency.com/feed/?best-topics=business-finance&post_type=best", "rss"),
-]
-
-# مصادر RSS مباشرة
+# ========== مصادر RSS مباشرة (بدون Brotli issues) ==========
 RSS_FEEDS = [
-    ("أخبار Investing", "https://www.investing.com/rss/news_285.rss"),
-    ("أخبار الأسواق", "https://www.investing.com/rss/news_25.rss"),
-    ("أخبار النفط", "https://www.investing.com/rss/news_3.rss"),
-    ("أخبار الذهب", "https://www.investing.com/rss/news_4.rss"),
-    ("أخبار العملات", "https://www.investing.com/rss/news_2.rss"),
+    ("اقتصاد", "https://www.investing.com/rss/news_285.rss"),
+    ("أسواق", "https://feeds.finance.yahoo.com/rss/2.0/headline?s=^GSPC,^DJI,^IXIC&region=US&lang=en-US"),
+    ("نفط", "https://www.nasdaq.com/feed/rssoutbound?symbol=CL%3DF"),
+    ("ذهب", "https://www.nasdaq.com/feed/rssoutbound?symbol=GC%3DF"),
+    ("عملات", "https://www.ecb.europa.eu/rss/fxref-usd.html"),
+    ("فيدرالي", "https://www.federalreserve.gov/feeds/press_all.xml"),
 ]
 
 KEYWORDS = {
-    'فائدة': ['interest rate', 'fed', 'central bank', 'فائدة', 'بنك مركزي', 'الفيدرالي'],
-    'تضخم': ['cpi', 'inflation', 'تضخم', 'أسعار', 'inflation'],
-    'بطالة': ['unemployment', 'jobs', 'بطالة', 'وظائف', 'employment'],
-    'ناتج': ['gdp', 'growth', 'ناتج', 'اقتصاد', 'اقتصادي'],
-    'نفط': ['oil', 'crude', 'بترول', 'نفط', 'أوبك', 'النفط'],
-    'ذهب': ['gold', 'ذهب', 'معدن', 'الذهب', 'bullion'],
-    'حرب': ['war', 'conflict', 'حرب', 'صراع', 'نزاع'],
-    'عقوبات': ['sanctions', 'عقوبات', 'عقوبة', 'embargo'],
+    'فائدة': ['interest rate', 'fed', 'central bank', 'فائدة', 'rates', 'monetary'],
+    'تضخم': ['cpi', 'inflation', 'تضخم', 'أسعار', 'prices', 'consumer'],
+    'بطالة': ['unemployment', 'jobs', 'بطالة', 'وظائف', 'employment', 'hiring'],
+    'ناتج': ['gdp', 'growth', 'ناتج', 'اقتصاد', 'economy', 'economic'],
+    'نفط': ['oil', 'crude', 'بترول', 'نفط', 'أوبك', 'opec', 'energy'],
+    'ذهب': ['gold', 'ذهب', 'معدن', 'precious', 'bullion', 'metal'],
+    'حرب': ['war', 'conflict', 'حرب', 'صراع', 'tension', 'military'],
+    'عقوبات': ['sanctions', 'عقوبات', 'embargo', 'ban', 'restrictions'],
 }
 
 # تخزين
 sent_articles = set()
 bot_started = False
-last_check_time = None
-ua = UserAgent()
 
 @app.route('/')
 def home():
@@ -73,117 +68,138 @@ def home():
         "service": "Telegram News Bot",
         "channel": CHANNEL_USERNAME,
         "bot_started": bot_started,
-        "articles_in_memory": len(sent_articles),
-        "last_check": last_check_time,
-        "uptime": time.strftime("%H:%M:%S", time.gmtime(time.time() - start_time))
+        "articles_sent": len(sent_articles),
+        "endpoints": {
+            "health": "/health",
+            "manual_check": "/check",
+            "test_channel": "/test-channel"
+        }
     })
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "healthy", "time": datetime.now().isoformat()}), 200
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat()
+    }), 200
 
 @app.route('/check')
-def check_now():
-    """فحص يدوي"""
-    threading.Thread(target=run_manual_check).start()
-    return jsonify({"message": "بدأ الفحص اليدوي", "time": datetime.now().strftime("%H:%M:%S")})
+def manual_check():
+    """فحص يدوي سريع"""
+    threading.Thread(target=run_quick_check).start()
+    return jsonify({
+        "message": "بدأ الفحص اليدوي السريع",
+        "time": datetime.now().strftime("%H:%M:%S")
+    })
 
-@app.route('/test/<path:url>')
-def test_url(url):
-    """اختبار جلب URL معين"""
+@app.route('/test-channel')
+def test_channel():
+    """اختبار إرسال رسالة إلى القناة"""
     async def test():
-        async with aiohttp.ClientSession() as session:
-            headers = await get_headers()
-            try:
-                async with session.get(f"https://{url}", headers=headers, timeout=10) as resp:
-                    return jsonify({
-                        "url": url,
-                        "status": resp.status,
-                        "headers": dict(resp.headers)
-                    })
-            except Exception as e:
-                return jsonify({"error": str(e)}), 500
+        try:
+            bot = Bot(token=TELEGRAM_BOT_TOKEN)
+            await bot.send_message(
+                chat_id=CHANNEL_USERNAME,
+                text="✅ اختبار: البوت يعمل بنجاح!\n" +
+                     "سيبدأ إرسال الأخبار الاقتصادية قريباً."
+            )
+            return jsonify({"success": True, "channel": CHANNEL_USERNAME})
+        except error.BadRequest as e:
+            return jsonify({"error": str(e), "channel": CHANNEL_USERNAME}), 400
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
     
     return asyncio.run(test())
 
-# ========== وظائف مساعدة ==========
-async def get_headers():
-    """إنشاء headers محاكية للمتصفح"""
-    return {
-        'User-Agent': ua.random,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'DNT': '1',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'Cache-Control': 'max-age=0',
-        'Referer': 'https://www.google.com/',
+# ========== وظائف RSS محسنة ==========
+async def fetch_rss_safe(session, url, source_name):
+    """جلب RSS بأمان مع headers مناسبة"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (compatible; RSSBot/1.0)',
+        'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+        'Accept-Encoding': 'gzip, deflate',  # لا نطلب brotli
     }
-
-def get_proxy():
-    """الحصول على proxy مجاني (اختياري)"""
-    proxies = [
-        None,  # بدون proxy أولاً
-        'http://proxy1:8080',
-        'http://proxy2:8080',
-    ]
-    return random.choice(proxies)
-
-def create_id(title, source):
-    """إنشاء ID فريد للخبر"""
-    text = f"{title[:50]}{source}"
-    return hashlib.md5(text.encode()).hexdigest()[:12]
-
-def categorize(title):
-    """تصنيف الخبر"""
-    title_lower = title.lower()
-    for cat, keywords in KEYWORDS.items():
-        for kw in keywords:
-            if kw.lower() in title_lower:
-                return cat
-    return "عام"
-
-# ========== جلب الأخبار من RSS (أفضل وأسهل) ==========
-async def fetch_rss_feed(session, url, source_name):
-    """جلب أخبار من RSS feed"""
+    
     try:
-        headers = await get_headers()
         async with session.get(url, headers=headers, timeout=15) as response:
             if response.status == 200:
-                xml = await response.text()
-                return parse_rss_feed(xml, source_name)
+                content_type = response.headers.get('Content-Type', '')
+                
+                # معالجة محتوى XML
+                if 'xml' in content_type or 'rss' in content_type or url.endswith('.xml') or url.endswith('.rss'):
+                    text = await response.text()
+                    return parse_rss_xml(text, source_name)
+                else:
+                    # محاولة كـ HTML
+                    text = await response.text()
+                    return parse_html_for_news(text, source_name)
+                    
+    except aiohttp.client_exceptions.ClientError as e:
+        logging.error(f"❌ خطأ شبكة في {source_name}: {e}")
+    except asyncio.TimeoutError:
+        logging.error(f"⏰ timeout في {source_name}")
     except Exception as e:
-        logging.error(f"❌ خطأ في RSS {source_name}: {e}")
+        logging.error(f"❌ خطأ في {source_name}: {e}")
+    
     return []
 
-def parse_rss_feed(xml, source_name):
-    """تحليل RSS feed"""
+def parse_rss_xml(xml_text, source_name):
+    """تحليل XML لـ RSS"""
+    articles = []
+    
     try:
-        soup = BeautifulSoup(xml, 'xml')
-        articles = []
+        # تنظيف النص أولاً
+        xml_text = re.sub(r'encoding="[^"]+"', 'encoding="utf-8"', xml_text)
+        xml_text = re.sub(r'&(?!(?:amp|lt|gt|quot|apos);)', '&amp;', xml_text)
         
-        items = soup.find_all('item')[:15]  # أول 15 خبر
+        root = ET.fromstring(xml_text)
         
-        for item in items:
+        # البحث عن items في RSS
+        items = []
+        for elem in root.iter():
+            if 'item' in elem.tag:
+                items.append(elem)
+        
+        if not items:
+            # محاولة بديلة
+            items = root.findall('.//item') or root.findall('.//entry')
+        
+        for item in items[:12]:  # أول 12 فقط
             try:
-                title = item.find('title').text.strip()
-                link = item.find('link').text.strip()
-                pub_date = item.find('pubDate')
-                time_text = pub_date.text.strip() if pub_date else "قبل قليل"
+                # استخراج العنوان
+                title_elem = item.find('title') or item.find('{http://www.w3.org/2005/Atom}title')
+                if title_elem is None:
+                    continue
+                    
+                title = title_elem.text.strip() if title_elem.text else ""
+                if not title or len(title) < 10:
+                    continue
                 
-                # وصف
-                description = item.find('description')
-                summary = description.text.strip()[:200] if description else ""
+                # استخراج الرابط
+                link_elem = item.find('link') or item.find('{http://www.w3.org/2005/Atom}link')
+                link = ""
+                if link_elem is not None:
+                    if link_elem.text:
+                        link = link_elem.text.strip()
+                    elif 'href' in link_elem.attrib:
+                        link = link_elem.attrib['href']
                 
-                news_type = categorize(title)
+                # استخراج الوقت
+                date_elem = item.find('pubDate') or item.find('published') or item.find('date')
+                time_text = date_elem.text.strip() if date_elem is not None and date_elem.text else "قبل قليل"
                 
-                article_data = {
-                    'id': create_id(title, source_name),
+                # استخراج الملخص
+                desc_elem = item.find('description') or item.find('summary') or item.find('content')
+                summary = desc_elem.text.strip()[:150] if desc_elem is not None and desc_elem.text else ""
+                
+                # تصنيف
+                news_type = categorize_news(title)
+                
+                # معرّف فريد
+                article_id = hashlib.md5(f"{title[:40]}{source_name}".encode()).hexdigest()[:10]
+                
+                articles.append({
+                    'id': article_id,
                     'title': title,
                     'link': link,
                     'time': time_text,
@@ -191,118 +207,112 @@ def parse_rss_feed(xml, source_name):
                     'type': news_type,
                     'source': source_name,
                     'timestamp': time.time()
-                }
+                })
                 
-                articles.append(article_data)
-                
-            except Exception:
+            except Exception as e:
                 continue
         
-        logging.info(f"📡 RSS {source_name}: {len(articles)} خبر")
-        return articles
+        logging.info(f"✅ RSS {source_name}: {len(articles)} خبر")
         
-    except Exception as e:
-        logging.error(f"❌ خطأ في تحليل RSS: {e}")
-        return []
-
-# ========== جلب من Investing.com (محاولة ذكية) ==========
-async def fetch_investing_smart(session, url, category):
-    """جلب أخبار بذكاء من Investing.com"""
-    try:
-        headers = await get_headers()
-        
-        # محاولة الصفحة الرئيسية أولاً
-        async with session.get(url, headers=headers, timeout=20) as response:
-            if response.status != 200:
-                logging.warning(f"⚠️ {category}: حالة {response.status}")
-                return []
-            
-            html = await response.text()
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            articles = []
-            
-            # البحث عن مقالات بطرق مختلفة
-            patterns = [
-                # أنماط Investing.com الشائعة
-                {'selector': 'article[data-test="article-item"]', 'title': 'a[data-test="article-title"]'},
-                {'selector': 'div.articleItem', 'title': 'a.title'},
-                {'selector': 'div.largeTitle', 'title': 'a'},
-                {'selector': 'div.mediumTitle', 'title': 'a'},
-                {'selector': 'div.textDiv', 'title': 'a'},
-                {'selector': '[class*="article"]', 'title': '[class*="title"]'},
-            ]
-            
-            for pattern in patterns:
-                items = soup.select(pattern['selector'])[:10]
-                if items:
-                    for item in items:
-                        try:
-                            title_elem = item.select_one(pattern['title'])
-                            if not title_elem:
-                                continue
-                            
-                            title = title_elem.text.strip()
-                            if len(title) < 10:
-                                continue
-                            
-                            link = title_elem.get('href', '')
-                            if link and not link.startswith('http'):
-                                link = f"https://www.investing.com{link}"
-                            
-                            time_elem = item.find('time') or item.find('span', class_='date')
-                            time_text = time_elem.text.strip() if time_elem else "قبل قليل"
-                            
-                            news_type = categorize(title)
-                            
-                            article_data = {
-                                'id': create_id(title, category),
+    except ET.ParseError as e:
+        logging.error(f"❌ خطأ في تحليل XML لـ {source_name}: {e}")
+        # محاولة بـ BeautifulSoup كبديل
+        try:
+            soup = BeautifulSoup(xml_text, 'html.parser')
+            items = soup.find_all(['item', 'entry'])[:10]
+            for item in items:
+                try:
+                    title = item.find('title')
+                    if title:
+                        title = title.text.strip()
+                        if len(title) > 10:
+                            articles.append({
+                                'id': hashlib.md5(title.encode()).hexdigest()[:10],
                                 'title': title,
-                                'link': link,
-                                'time': time_text,
-                                'type': news_type,
-                                'source': category,
+                                'link': "",
+                                'time': "قبل قليل",
+                                'summary': "",
+                                'type': categorize_news(title),
+                                'source': source_name,
                                 'timestamp': time.time()
-                            }
-                            
-                            articles.append(article_data)
-                            
-                        except Exception:
-                            continue
-                    
-                    if articles:
-                        break
-            
-            logging.info(f"📡 {category}: وجد {len(articles)} خبر")
-            return articles
-            
-    except Exception as e:
-        logging.error(f"❌ خطأ في {category}: {e}")
-        return []
+                            })
+                except:
+                    continue
+            logging.info(f"✅ RSS (بديل) {source_name}: {len(articles)} خبر")
+        except:
+            pass
+    
+    return articles
+
+def parse_html_for_news(html, source_name):
+    """تحليل HTML لأخبار (كبديل)"""
+    soup = BeautifulSoup(html, 'html.parser')
+    articles = []
+    
+    # البحث عن عناوين
+    headlines = []
+    for tag in ['h1', 'h2', 'h3', 'h4']:
+        headlines.extend(soup.find_all(tag))
+    
+    for headline in headlines[:15]:
+        title = headline.get_text(strip=True)
+        if len(title) > 20 and len(title) < 200:
+            news_type = categorize_news(title)
+            if news_type != "عام":  # فقط المهمة
+                articles.append({
+                    'id': hashlib.md5(title.encode()).hexdigest()[:10],
+                    'title': title,
+                    'link': "",
+                    'time': "حديث",
+                    'summary': "",
+                    'type': news_type,
+                    'source': source_name,
+                    'timestamp': time.time()
+                })
+    
+    return articles
+
+def categorize_news(title):
+    """تصنيف الخبر"""
+    title_lower = title.lower()
+    for category, keywords in KEYWORDS.items():
+        for keyword in keywords:
+            if keyword.lower() in title_lower:
+                return category
+    return "عام"
 
 # ========== إرسال إلى تليجرام ==========
-async def send_to_channel(bot, article):
+async def send_news_to_channel(bot, article):
     """إرسال خبر إلى القناة"""
     try:
+        # إيموجيات حسب النوع
         emoji_map = {
             'فائدة': '🏦', 'تضخم': '📈', 'بطالة': '👥',
             'ناتج': '📊', 'نفط': '🛢️', 'ذهب': '💰',
-            'حرب': '⚔️', 'عقوبات': '🚫', 'عام': '📰'
+            'حرب': '⚔️', 'عقوبات': '🚫'
         }
         
         emoji = emoji_map.get(article['type'], '📰')
         
-        # تنسيق الرسالة
-        message = f"""
-{emoji} **{article['type'].upper()}** | {article['source']}
-
-{article['title']}
-
-⏰ {article['time']}
-
-🔗 [قراءة الخبر]({article['link']})
-        """
+        # بناء الرسالة
+        message_lines = []
+        message_lines.append(f"{emoji} **{article['type'].upper()}** | {article['source']}")
+        message_lines.append("")
+        message_lines.append(f"{article['title']}")
+        message_lines.append("")
         
+        if article['summary']:
+            message_lines.append(f"{article['summary']}")
+            message_lines.append("")
+        
+        message_lines.append(f"⏰ {article['time']}")
+        
+        if article['link']:
+            message_lines.append(f"🔗 [اقرأ المزيد]({article['link']})")
+        
+        message = "\n".join(message_lines)
+        
+        # إرسال
         await bot.send_message(
             chat_id=CHANNEL_USERNAME,
             text=message[:4000],
@@ -310,131 +320,156 @@ async def send_to_channel(bot, article):
             disable_web_page_preview=False
         )
         
-        logging.info(f"✅ تم إرسال: {article['title'][:60]}...")
+        logging.info(f"✅ تم إرسال: {article['title'][:50]}...")
         sent_articles.add(article['id'])
         return True
         
+    except error.BadRequest as e:
+        if "Chat not found" in str(e):
+            logging.error(f"❌ القناة غير موجودة: {CHANNEL_USERNAME}")
+            logging.error("⚠️ تأكد من:")
+            logging.error("   1. القناة موجودة")
+            logging.error("   2. البوت مسؤول في القناة")
+            logging.error("   3. المعرف صحيح ويبدأ بـ @")
+        else:
+            logging.error(f"❌ خطأ في الإرسال: {e}")
+        return False
+        
     except Exception as e:
-        logging.error(f"❌ فشل إرسال: {str(e)[:100]}")
+        logging.error(f"❌ خطأ غير متوقع: {e}")
         return False
 
 # ========== الدورة الرئيسية ==========
-async def news_bot_loop():
-    """الدورة الرئيسية للبوت"""
-    global bot_started, last_check_time
+async def main_news_loop():
+    """الدورة الرئيسية"""
+    global bot_started
     
+    # اختبار البوت والقناة أولاً
     try:
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
         bot_info = await bot.get_me()
-        logging.info(f"🤖 البوت جاهز: @{bot_info.username}")
+        logging.info(f"🤖 البوت: @{bot_info.username}")
         
-        # إرسال رسالة بدء التشغيل
-        try:
-            await bot.send_message(
-                chat_id=CHANNEL_USERNAME,
-                text="🚀 بوت الأخبار المالية يعمل الآن!\nسيتم إرسال آخر الأخبار الاقتصادية تلقائياً."
-            )
-        except:
-            pass
-        
+        # اختبار إرسال رسالة
+        await bot.send_message(
+            chat_id=CHANNEL_USERNAME,
+            text="📢 بوت الأخبار المالية يعمل الآن!\nجاري تجميع آخر الأخبار..."
+        )
+        logging.info(f"✅ اختبار الإرسال ناجح إلى: {CHANNEL_USERNAME}")
         bot_started = True
         
+    except error.BadRequest as e:
+        logging.error(f"❌ فشل اختبار القناة: {e}")
+        logging.error("⚠️ حل المشكلة:")
+        logging.error("   1. تأكد من صحة معرف القناة")
+        logging.error("   2. تأكد أن البوت مسؤول في القناة")
+        logging.error("   3. المعرف يجب أن يكون مثل: @MarketNewsArabia")
+        return
     except Exception as e:
         logging.error(f"❌ فشل بدء البوت: {e}")
         return
     
+    # الدورة الرئيسية
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                last_check_time = datetime.now().strftime("%H:%M:%S")
                 logging.info("=" * 60)
-                logging.info(f"🔄 بدء فحص جديد: {last_check_time}")
+                logging.info(f"🔄 بدء فحص: {datetime.now().strftime('%H:%M:%S')}")
                 
                 all_articles = []
                 
-                # 1. أولاً: جلب من RSS (الأسهل والأكثر موثوقية)
-                logging.info("📡 مرحلة 1: جلب من RSS feeds...")
-                for source_name, rss_url in RSS_FEEDS:
-                    articles = await fetch_rss_feed(session, rss_url, source_name)
-                    all_articles.extend(articles)
-                    await asyncio.sleep(1)
+                # جلب من مصادر RSS
+                tasks = []
+                for source_name, url in RSS_FEEDS:
+                    tasks.append(fetch_rss_safe(session, url, source_name))
                 
-                # 2. ثانياً: جلب من Investing.com (إذا كان RSS قليلاً)
-                if len(all_articles) < 5:
-                    logging.info("📡 مرحلة 2: جلب من Investing.com...")
-                    for category, url, _ in NEWS_SOURCES[:3]:  # أول 3 مصادر فقط
-                        articles = await fetch_investing_smart(session, url, category)
-                        all_articles.extend(articles)
-                        await asyncio.sleep(2)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
                 
-                # 3. تصفية وترتيب
-                important_articles = [a for a in all_articles if a['type'] != 'عام']
+                for result in results:
+                    if isinstance(result, list):
+                        all_articles.extend(result)
+                
+                # تصفية وترتيب
+                important_articles = []
+                general_articles = []
+                
+                for article in all_articles:
+                    if article['type'] != "عام":
+                        important_articles.append(article)
+                    else:
+                        general_articles.append(article)
+                
+                # ترتيب حسب الأهمية والوقت
                 important_articles.sort(key=lambda x: x['timestamp'], reverse=True)
                 
-                # 4. إرسال الجديدة
+                # إرسال المهمة أولاً
                 sent_count = 0
-                for article in important_articles[:8]:  # أول 8 مهمة فقط
+                for article in important_articles[:5]:  # أول 5 مهمة
                     if article['id'] not in sent_articles:
-                        success = await send_to_channel(bot, article)
+                        success = await send_news_to_channel(bot, article)
                         if success:
                             sent_count += 1
-                            await asyncio.sleep(2)
+                            await asyncio.sleep(2)  # انتظار بين الإرسال
                 
-                # 5. الإحصائيات
+                # إرسال عامة إذا لم يكن هناك مهمة
+                if sent_count == 0 and general_articles:
+                    for article in general_articles[:3]:  # أول 3 عامة
+                        if article['id'] not in sent_articles:
+                            success = await send_news_to_channel(bot, article)
+                            if success:
+                                sent_count += 1
+                                await asyncio.sleep(2)
+                
+                # تنظيف الذاكرة
+                if len(sent_articles) > 100:
+                    sent_articles.clear()
+                
+                # إحصائيات
                 logging.info("=" * 60)
                 logging.info(f"📊 النتائج:")
                 logging.info(f"   📝 إجمالي الأخبار: {len(all_articles)}")
-                logging.info(f"   ⭐ الأخبار المهمة: {len(important_articles)}")
-                logging.info(f"   📤 المرسلة حديثاً: {sent_count}")
-                logging.info(f"   💾 المخزنة: {len(sent_articles)}")
-                
-                if len(all_articles) == 0:
-                    logging.warning("⚠️ لم يتم العثور على أخبار! اختبار الاتصال...")
-                    test_resp = await session.get('https://www.google.com', headers=await get_headers())
-                    logging.info(f"🌐 اختبار الاتصال: {test_resp.status}")
-                
+                logging.info(f"   ⭐ المهمة: {len(important_articles)}")
+                logging.info(f"   📰 العامة: {len(general_articles)}")
+                logging.info(f"   📤 المرسلة: {sent_count}")
                 logging.info("=" * 60)
                 
             except Exception as e:
                 logging.error(f"🚨 خطأ في الدورة: {e}")
             
-            logging.info(f"⏳ الانتظار {CHECK_INTERVAL//60} دقائق للفحص التالي...")
+            logging.info(f"⏳ الانتظار {CHECK_INTERVAL//60} دقيقة للفحص التالي...")
             await asyncio.sleep(CHECK_INTERVAL)
 
-def run_manual_check():
-    """فحص يدوي"""
-    async def check():
+def run_quick_check():
+    """فحص يدوي سريع"""
+    async def quick():
         try:
             bot = Bot(token=TELEGRAM_BOT_TOKEN)
             async with aiohttp.ClientSession() as session:
                 logging.info("🔍 فحص يدوي سريع...")
                 
-                # اختبار RSS مباشرة
-                articles = []
-                for source_name, rss_url in RSS_FEEDS[:2]:  # أول مصدرين فقط
-                    feed_articles = await fetch_rss_feed(session, rss_url, source_name)
-                    articles.extend(feed_articles)
+                # اختبار مصدر واحد
+                articles = await fetch_rss_safe(session, RSS_FEEDS[0][1], RSS_FEEDS[0][0])
                 
                 if articles:
-                    logging.info(f"✅ الفحص اليدوي: {len(articles)} خبر")
-                    for article in articles[:3]:  # أول 3
-                        await send_to_channel(bot, article)
+                    logging.info(f"✅ الفحص: {len(articles)} خبر")
+                    for article in articles[:2]:
+                        await send_news_to_channel(bot, article)
                         await asyncio.sleep(1)
                 else:
-                    logging.warning("⚠️ الفحص اليدوي: 0 خبر")
+                    logging.warning("⚠️ لا توجد أخبار")
                     
         except Exception as e:
-            logging.error(f"❌ خطأ في الفحص اليدوي: {e}")
+            logging.error(f"❌ خطأ في الفحص: {e}")
     
-    asyncio.run(check())
+    asyncio.run(quick())
 
-def start_bot():
+def start_bot_background():
     """بدء البوت في الخلفية"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.run_until_complete(news_bot_loop())
+    loop.run_until_complete(main_news_loop())
 
-def run_flask():
+def run_flask_app():
     """تشغيل Flask"""
     port = int(os.getenv('PORT', 10000))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
@@ -448,24 +483,22 @@ if __name__ == "__main__":
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
-    start_time = time.time()
-    
     logging.info("=" * 70)
-    logging.info("🚀 بدء تشغيل بوت الأخبار المالية المتقدم")
+    logging.info("🚀 بدء تشغيل بوت الأخبار المالية")
     logging.info(f"📢 القناة: {CHANNEL_USERNAME}")
     logging.info(f"⏰ فترة الفحص: {CHECK_INTERVAL} ثانية ({CHECK_INTERVAL//60} دقيقة)")
     logging.info(f"📡 مصادر RSS: {len(RSS_FEEDS)}")
     logging.info("=" * 70)
     
-    # بدء Flask في thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    # بدء Flask
+    flask_thread = threading.Thread(target=run_flask_app, daemon=True)
     flask_thread.start()
     
     # تأخير ثم بدء البوت
-    time.sleep(5)
+    time.sleep(3)
     
-    # بدء البوت في thread منفصل
-    bot_thread = threading.Thread(target=start_bot, daemon=True)
+    # بدء البوت
+    bot_thread = threading.Thread(target=start_bot_background, daemon=True)
     bot_thread.start()
     
     # إبقاء البرنامج يعمل
